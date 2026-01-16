@@ -1,0 +1,120 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+.installed.cfg
+*.egg-info/
+MANIFEST
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+py38_oktopk/
+
+# External dependencies (should be cloned separately)
+apex/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+checkpoint/
+checkpoints/
+
+# Data files
+*.tar.gz
+*.zip
+*.tgz
+*.gz
+*.bz2
+*.7z
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Dataset directories (uncomment if you don't want to track data)
+# VGG/vgg_data/cifar-10-*
+# LSTM/audio_data/an4/
+# BERT/bert/bert_data/
+
+# Logs and outputs
+*.log
+*.txt
+*.out
+*.err
+logs/
+output/
+results/
+tensorboard_logs/
+
+# SLURM job outputs
+slurm-*.out
+*.o[0-9]*
+*.e[0-9]*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Compiled CUDA
+*.o
+*.so
+*.a
+*.cu.o
+
+# Build directories
+apex/build/
+apex/dist/
+apex/*.egg-info/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentation builds (if using Sphinx)
+docs/_build/
+docs/_static/
+docs/_templates/
