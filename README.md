@@ -1,4 +1,19 @@
+# Ok-Topk Analysis and Study
+
+This repository contains an analysis of the Ok-Topk algorithm for near-optimal sparse allreduce in distributed deep learning. The work focuses on:
+
+- **Understanding Ok-Topk's communication patterns and worker coordination** - Analysis of how MPI processes communicate during distributed training
+- **Reproducing the original results on smaller-scale test cases** - Validation and experimentation with reduced cluster sizes
+- **Analyzing alternative communication approaches** - Exploring modern primitives such as NCCL and NVSHMEM for collective operations
+- **Comparing communication efficiency** - Evaluating different implementations of sparse allreduce algorithms
+
+## Documentation
+
+- **[REPOSITORY_GUIDE.md](REPOSITORY_GUIDE.md)** - Overview of repository structure and key files
+- **[PARALLELIZATION_AND_COMMUNICATION_GUIDE.md](PARALLELIZATION_AND_COMMUNICATION_GUIDE.md)** - Detailed explanation of worker communication and MPI implementation
+
 ## Near-Optimal Sparse Allreduce for Distributed Deep Learning (published in PPoPP'22)
+
 Ok-Topk is a scheme for distributed training with sparse gradients. Ok-Topk integrates a novel sparse allreduce algorithm (less than 6k communication volume which is asymptotically optimal) with the decentralized parallel Stochastic Gradient Descent (SGD) optimizer, and its convergence is proved theoretically and empirically. All baselines, such as TopkDSA, gTopk, and Guassiank, are already integrated in the repo.
 
 ## Setup the environment
