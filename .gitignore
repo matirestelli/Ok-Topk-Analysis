@@ -55,10 +55,18 @@ checkpoints/
 *.pkl
 *.pickle
 
-# Dataset directories (uncomment if you don't want to track data)
-# VGG/vgg_data/cifar-10-*
-# LSTM/audio_data/an4/
-# BERT/bert/bert_data/
+# Dataset directories (do not track data files)
+VGG/vgg_data/
+LSTM/audio_data/
+BERT/bert/bert_data/
+LSTM/bert_data/
+*/audio_data/
+*/vgg_data/
+*/bert_data/
+*.wav
+*.mp3
+*.flac
+*.m4a
 
 # Logs and outputs
 *.log
