@@ -11,12 +11,23 @@ This repository contains an analysis of the Ok-Topk algorithm for near-optimal s
 
 - **[REPOSITORY_GUIDE.md](REPOSITORY_GUIDE.md)** - Overview of repository structure and key files
 - **[PARALLELIZATION_AND_COMMUNICATION_GUIDE.md](PARALLELIZATION_AND_COMMUNICATION_GUIDE.md)** - Detailed explanation of worker communication and MPI implementation
+- **[POLARIS_SETUP_GUIDE.md](POLARIS_SETUP_GUIDE.md)** - Setup instructions for running on Polaris supercomputer (ALCF)
 
 ## Near-Optimal Sparse Allreduce for Distributed Deep Learning (published in PPoPP'22)
 
 Ok-Topk is a scheme for distributed training with sparse gradients. Ok-Topk integrates a novel sparse allreduce algorithm (less than 6k communication volume which is asymptotically optimal) with the decentralized parallel Stochastic Gradient Descent (SGD) optimizer, and its convergence is proved theoretically and empirically. All baselines, such as TopkDSA, gTopk, and Guassiank, are already integrated in the repo.
 
 ## Setup the environment
+
+### For Polaris Supercomputer (ALCF)
+**See [POLARIS_SETUP_GUIDE.md](POLARIS_SETUP_GUIDE.md) for detailed Polaris-specific instructions.**
+
+Quick setup on Polaris:
+```bash
+bash setup_polaris_env.sh
+```
+
+### For Other Systems (Generic Setup)
 To install the required Python modules: 
 
 `conda create --name py38_oktopk python=3.8`
