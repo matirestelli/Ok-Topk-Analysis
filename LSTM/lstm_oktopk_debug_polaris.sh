@@ -5,8 +5,8 @@
 #PBS -q debug-scaling
 #PBS -A UIC-HPC
 #PBS -N lstm_oktopk_debug
-#PBS -o logs/lstm_oktopk_debug_${PBS_JOBID}.out
-#PBS -e logs/lstm_oktopk_debug_${PBS_JOBID}.err
+#PBS -o /home/mrest/Ok-Topk-Analysis/LSTM/logs/lstm_oktopk_debug_${PBS_JOBID}.out
+#PBS -e /home/mrest/Ok-Topk-Analysis/LSTM/logs/lstm_oktopk_debug_${PBS_JOBID}.err
 
 # Change to the directory where the job was submitted
 cd ${PBS_O_WORKDIR}
@@ -47,10 +47,10 @@ nworkers="${nworkers:-8}"  # 2 nodes * 4 GPUs per node = 8 workers total
 echo "Running with $nworkers workers"
 nwpernode=4  # Using 4 GPUs per node (max capability)
 sigmascale=2.5
-PY=python
+PY=$HOME/miniconda3/envs/py38_oktopk/bin/python
 
-# Run the training (srun provides MPI environment automatically)
-srun python main_trainer.py \
+# Run the training (use mpirun for MPI environment)
+mpirun -np $nworkers $PY main_trainer.py \
     --dnn $dnn \
     --dataset $dataset \
     --max-epochs $max_epochs \

@@ -54,11 +54,18 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._lock = threading.Lock()
         self._key_lock = threading.Lock()
         self.momentum_correction = False
-        self._allreducer = ar.AllReducer(named_parameters, self._lock, self._key_lock, compressor, sparse=self._sparse, err_callback=err_handler, layerwise_times=layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, msg_queue=self._msg_queue, msg_queue2=self._msg_queue2, writer=writer)
+        # fixes made: Pass trainer=None to AllReducer for later initialization
+        self._allreducer = ar.AllReducer(named_parameters, self._lock, self._key_lock, compressor, sparse=self._sparse, err_callback=err_handler, layerwise_times=layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, msg_queue=self._msg_queue, msg_queue2=self._msg_queue2, writer=writer, trainer=None)
         self.allreducer_thread = threading.Thread(name='allreducer', target=self._allreducer.run)
         self.allreducer_thread.start()
         self.local = False
         self._synced = False
+
+    # fixes made: Add setter method for trainer reference after initialization
+    def set_trainer(self, trainer):
+        """Set trainer reference for metrics tracking"""
+        if self._allreducer is not None:
+            self._allreducer._trainer = trainer
 
     def _register_hooks(self):
         for param_group in self.param_groups:
@@ -126,7 +133,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 d_p = p.grad.data
                 name = self._parameter_names.get(p)
                 if weight_decay != 0:
-                    d_p.add_(weight_decay, p.data)
+                    # fixes made: Fix deprecated PyTorch API for add_ with weight_decay
+                    d_p.add_(p.data, alpha=weight_decay)
                 #if name.find('bias') >= 0 or name.find('bn') >= 0:
                 #    print('batch norm or bias detected, continue, %s' % name)
                 if momentum != 0 and not self.momentum_correction:
@@ -166,7 +174,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 d_p = p.grad.data
                 name = self._parameter_names.get(p)
                 if weight_decay != 0:
-                    d_p.add_(weight_decay, p.data)
+                    # fixes made: Fix deprecated PyTorch API for add_ with weight_decay (also in _step_with_mc)
+                    d_p.add_(p.data, alpha=weight_decay)
                 if momentum != 0:
                     param_state = self.state[p]
                     if 'momentum_buffer' not in param_state:

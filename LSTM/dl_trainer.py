@@ -133,6 +133,7 @@ class DLTrainer:
             self.num_classes = 10
         self.nworkers = nworkers # just for easy comparison
         self.data_dir = data_dir
+        self.ext = None  # Initialize ext early to avoid AttributeError
         if type(dnn) != str:
             self.net = dnn
             self.dnn = dnn.name
@@ -179,8 +180,8 @@ class DLTrainer:
             else:
                 self.criterion = nn.CrossEntropyLoss()
         else:
-            from warpctc_pytorch import CTCLoss
-            self.criterion = CTCLoss()
+            # Use PyTorch's native CTCLoss instead of warpctc_pytorch
+            self.criterion = nn.CTCLoss()
         weight_decay = 1e-4
         self.m = 0.9 # momentum
         nesterov = False
@@ -496,10 +497,10 @@ class DLTrainer:
     def data_iter(self):
         #d = self.data_iterator.next()
         try:
-            d = self.data_iterator.next()
+            d = next(self.data_iterator)
         except:
             self.data_iterator = iter(self.trainloader)
-            d = self.data_iterator.next()
+            d = next(self.data_iterator)
         
         if d[0].size()[0] != self.batch_size:
             return self.data_iter()
@@ -606,16 +607,27 @@ class DLTrainer:
                     logger.info('train iter: %d, num_batches_per_epoch: %d', self.train_iter, self.num_batches_per_epoch)
                     #logger.info('Epoch %d, avg train acc: %f, lr: %f, avg loss: %f' % (self.train_iter//self.num_batches_per_epoch, np.mean(self.train_acc_top1), self.lr, self.avg_loss_per_epoch/self.num_batches_per_epoch))
                     logger.info('Epoch %d, avg train acc: %f, lr: %f, avg loss: %f' % (self.train_epoch, np.mean(self.train_acc_top1), self.lr, self.avg_loss_per_epoch/self.num_batches_per_epoch))
-                mean_s = np.mean(self.sparsities)
-                if self.train_iter>0 and np.isnan(mean_s):
-                    logger.warn('NaN detected! sparsities:  %s' % self.sparsities)
-                logger.info('Average Sparsity: %f, compression ratio: %f, communication size: %f', np.mean(self.sparsities), np.mean(self.compression_ratios), np.mean(self.communication_sizes))
                 if self.rank == 0 and self.writer is not None:
                     self.writer.add_scalar('cross_entropy', self.avg_loss_per_epoch/self.num_batches_per_epoch, self.train_epoch)
                     self.writer.add_scalar('top-1 acc', np.mean(self.train_acc_top1), self.train_epoch)
                 if self.rank == 0 and (self.train_epoch == 0 or (self.train_epoch+1)%5 == 0):
                     print("test epoch: ", self.train_epoch+1)
                     self.test(self.train_epoch+1)
+                # Collect metrics AFTER validation (AllReducer populates asynchronously)
+                # Only log sparsity metrics if they've been populated by the AllReducer thread
+                if self.rank == 0:
+                    if len(self.sparsities) > 0 and \
+                       len(self.compression_ratios) > 0 and \
+                       len(self.communication_sizes) > 0:
+                        avg_s = float(np.mean(self.sparsities))
+                        avg_cr = float(np.mean(self.compression_ratios))
+                        avg_commsize = float(np.mean(self.communication_sizes))
+                        logger.info('Average Sparsity: %f, compression ratio: %f, communication size: %f', 
+                                    avg_s, avg_cr, avg_commsize)
+                    else:
+                        # Metrics not ready yet (normal in early epochs during sparse phase ramp-up)
+                        logger.debug('Sparsity metrics not ready yet (len=%d); skipping this epoch',
+                                     len(self.sparsities))
                 self.sparsities = []
                 self.compression_ratios = []
                 self.communication_sizes = []

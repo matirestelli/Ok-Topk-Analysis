@@ -13,6 +13,9 @@ MINICONDA_DIR="$HOME/miniconda3"
 source "$MINICONDA_DIR/etc/profile.d/conda.sh"
 conda activate py38_oktopk
 
+# Install required packages if missing
+pip install psutil --quiet 2>/dev/null || true
+
 # Set LD_LIBRARY_PATH for mpi4py to find Cray MPICH ABI-compatible libraries
 export LD_LIBRARY_PATH=/opt/cray/pe/mpich/9.0.1/ofi/nvidia/23.3/lib-abi-mpich:$LD_LIBRARY_PATH
 
@@ -23,6 +26,9 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_CROSS_NIC=1
 export NCCL_COLLNET_ENABLE=1
+
+# Workaround for tensorboardX/protobuf incompatibility (if needed)
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # Print environment info for debugging
 echo "========================================="

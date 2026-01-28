@@ -68,6 +68,13 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
     optimizer = dopt.DistributedOptimizer(trainer.optimizer, trainer.net.named_parameters(), compression=compressor, is_sparse=is_sparse, err_handler=_error_handler, layerwise_times=None, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, writer=writer)
 
     trainer.update_optimizer(optimizer)
+    # fixes made: Initialize trainer reference in distributed optimizer for metrics tracking
+    try:
+        optimizer.set_trainer(trainer)
+    except AttributeError:
+        # Fallback for dynamic class wrapper
+        if hasattr(optimizer, '_allreducer'):
+            optimizer._allreducer._trainer = trainer
 
     iters_per_epoch = trainer.get_num_of_training_samples() // (nworkers * batch_size * nsteps_update)
 
@@ -153,7 +160,8 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='imagenet', choices=_support_datasets, help='Specify the dataset for training')
     parser.add_argument('--dnn', type=str, default='resnet50', choices=_support_dnns, help='Specify the neural network for training')
     parser.add_argument('--data-dir', type=str, default='./data', help='Specify the data root path')
-    parser.add_argument('--lr', type=float, default=0.1, help='Default learning rate')
+    # fixes made: Reduced default learning rate from 0.1 to 0.01 to prevent gradient explosion with sparse updates
+    parser.add_argument('--lr', type=float, default=0.01, help='Default learning rate')
     parser.add_argument('--max-epochs', type=int, default=90, help='Default maximum epochs to train')
     parser.add_argument('--pretrain', type=str, default=None, help='Specify the pretrain path')
     parser.set_defaults(compression=False)

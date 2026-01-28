@@ -194,7 +194,8 @@ def force_insert_item(d, key, val):
 
 
 class AllReducer():
-    def __init__(self, named_parameters, lock, key_lock, compression, sparse=False, err_callback=None, layerwise_times=None, sigma_scale=2.5, density=0.001, train_epoch=0, norm_clip=None, msg_queue=None, msg_queue2=None, writer=None):
+    # fixes made: Added trainer parameter to constructor for metrics tracking
+    def __init__(self, named_parameters, lock, key_lock, compression, sparse=False, err_callback=None, layerwise_times=None, sigma_scale=2.5, density=0.001, train_epoch=0, norm_clip=None, msg_queue=None, msg_queue2=None, writer=None, trainer=None):
         self._running = False 
         self._msg_queue = msg_queue
         self._msg_queue2 = msg_queue2
@@ -575,6 +576,11 @@ class AllReducer():
                 rank = comm.rank
 
                 stime = time.time()
+                # DEBUG: Log counter value to understand warm-up phase
+                rank = comm.rank
+                if rank == 0 and self._allreduce_counter[new_name] in [1, 80, 120, 127, 128, 129, 150]:
+                    logger.info('DEBUG counter[%s]=%d (sparse=%s, sparse_name=%s)', new_name[:20], self._allreduce_counter[new_name], self._sparse, self._compression.name if self._sparse else 'N/A')
+                
                 if self._allreduce_counter[new_name] < 128:
                     result = self._dense_allreduce(new_name, new_tensor)
                 elif self._sparse and self._compression.name == 'oktopk':
@@ -1048,6 +1054,31 @@ class AllReducer():
                             result = new_tensor
                             result.data.fill_(0.)
                             result[all_gindexes_tensor] = all_gvalues_tensor
+
+                            # fixes made: Track sparsity and compression metrics for trainer
+                            if self._trainer is not None:
+                                try:
+                                    global_topk_count = all_gindexes.size
+                                    tensor_size = torch.numel(new_tensor.data)
+                                    
+                                    if tensor_size > 0 and global_topk_count > 0:
+                                        sparsity = 1.0 - (float(global_topk_count) / float(tensor_size))
+                                        compression_ratio = float(tensor_size) / float(global_topk_count)
+                                        communication_size = global_topk_count * 2 * 4
+                                        
+                                        self._trainer.sparsities.append(sparsity)
+                                        self._trainer.compression_ratios.append(compression_ratio)
+                                        self._trainer.communication_sizes.append(communication_size)
+                                        
+                                        # Log first successful append
+                                        if len(self._trainer.sparsities) == 1 and rank == 0:
+                                            logger.info('SUCCESS: First sparsity metric tracked! sparsity=%.4f', sparsity)
+                                except Exception as e:
+                                    rank_ex = MPI.COMM_WORLD.rank
+                                    if rank_ex == 0:
+                                        logger.error('CRITICAL: Failed to track metrics: %s', str(e))
+                            elif rank == 0 and self._allreduce_counter[new_name] == 129:
+                                logger.error('CRITICAL: trainer is None at iteration 129! Cannot track sparsity!')
 
                         if settings.PROFILING_NORM:
                             with torch.no_grad():
