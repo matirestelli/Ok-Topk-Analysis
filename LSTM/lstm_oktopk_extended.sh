@@ -37,6 +37,13 @@ nwpernode=4
 sigmascale=2.5
 PY=$HOME/miniconda3/envs/py38_oktopk/bin/python
 
+# Reset CUDA before running (clears any stale CUDA contexts)
+export CUDA_LAUNCH_BLOCKING=1
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+# MIG mode is system-configured, skip admin-level commands
+# Just let PyTorch/CUDA driver handle GPU allocation
+
 # Run the training
 mpirun -np $nworkers $PY main_trainer.py \
     --dnn $dnn \

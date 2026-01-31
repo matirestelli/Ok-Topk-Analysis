@@ -69,6 +69,12 @@ def topk_sparse_allreduce(comm, sparse_tensor, storage, indexes=None, dtype=np.f
         return result, None
 
     nnz = k
+    #logging to analize size of messages (added to the original final logging file)
+    values_size_bytes = values.nbytes
+    indexes_size_bytes = indexes.nbytes
+    logger.info(f"ALLGATHER_VALUES|rank={rank}|layer={layer_name}|size={values_size_bytes}|size_mb={values_size_bytes/1e6:.2f}|round={current_round}")
+    logger.info(f"ALLGATHER_INDEXES|rank={rank}|layer={layer_name}|size={indexes_size_bytes}|size_mb={indexes_size_bytes/1e6:.2f}|round={current_round}")
+    
     comm.Allgather(values, values_1d[:num_workers*nnz])
     comm.Allgather(indexes, indexes_1d[:num_workers*nnz])
     return values_1d, indexes_1d, None #result, None
@@ -125,6 +131,10 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
             local_rank = participate_ranks.index(rank)
             if local_rank % 2 == 0:
                 source = participate_ranks[local_rank+1]
+                #logging to analize size of messages (added to the original final logging file)
+                recv_size_bytes = recv_values.nbytes
+                logger.info(f"RECV|to_rank={rank}|from_rank={source}|size={recv_size_bytes}|size_mb={recv_size_bytes/1e6:.2f}|round={i}|layer={layer_name}")
+                
                 comm.Recv([recv_values, MPI.FLOAT], source=source)
                 #reqr = comm.Irecv([recv_values, MPI.FLOAT], source=source)
                 #reqr.Wait()
@@ -148,6 +158,10 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
             else:
                 target = participate_ranks[local_rank-1]
                 logger.debug('[round:%d], %d(%d)->%d(%d)', i, rank, local_rank, target, local_rank-1)
+                #logging to analize size of messages (added to the original final logging file)
+                send_size_bytes = send_values.nbytes
+                logger.info(f"SEND|from_rank={rank}|to_rank={target}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|round={i}|layer={layer_name}")
+                
                 comm.Send([send_values, MPI.FLOAT], dest=target)
                 #reqs = comm.Isend([send_values, MPI.FLOAT], dest=target)
                 #reqs.Wait()
@@ -180,6 +194,13 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
 def dense_allreduce(comm, tensor):
     result = np.zeros_like(tensor)
     op = MPI.SUM
+    
+    #logging to analize size of messages (added to the original final logging file)
+    tensor_size_bytes = tensor.nbytes
+    rank = comm.rank
+    num_workers = comm.size
+    logger.info(f"ALLREDUCE_DENSE|rank={rank}|size={tensor_size_bytes}|size_mb={tensor_size_bytes/1e6:.2f}|num_workers={num_workers}")
+                
     comm.Allreduce(tensor, result, op)
     comm.Barrier()
     return result
@@ -645,6 +666,11 @@ class AllReducer():
                             index_boundaries[i] = index_chunk * i
                         region_boundaries = local_topk_indexes[index_boundaries[1:]]
                         global_boundaries = np.zeros_like(region_boundaries)
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        region_boundaries_size_bytes = region_boundaries.nbytes
+                        logger.info(f"ALLREDUCE_REGION|rank={rank}|size={region_boundaries_size_bytes}|size_mb={region_boundaries_size_bytes/1e6:.2f}|layer={new_name}")
+                
                         comm.Allreduce(region_boundaries, global_boundaries, MPI.SUM)
                         global_boundaries //= num_workers
 
@@ -707,6 +733,11 @@ class AllReducer():
                         self._local_topk_dict[self._allreduce_counter[new_name]] = ssizes.sum()
 
                     # transpose the send buffer sizes
+                    #logging to analize size of messages (added to the original final logging file)
+                    alltoall_send_bytes = ssizes.nbytes
+                    alltoall_recv_bytes = rsizes.nbytes
+                    logger.info(f"ALLTOALL|rank={rank}|send_size={alltoall_send_bytes}|send_mb={alltoall_send_bytes/1e6:.2f}|recv_size={alltoall_recv_bytes}|recv_mb={alltoall_recv_bytes/1e6:.2f}|layer={new_name}")
+                
                     comm.Alltoall(ssizes, rsizes)
                     total_red_size = rsizes.sum()
                     whole_value_rbuffers = np.zeros(total_red_size, dtype='float32')
@@ -749,6 +780,15 @@ class AllReducer():
                             all_index_rbuffers[i][:] = all_index_sbuffers[dst][:]
                         else:
                             #exchange buffer
+                            #logging to analize size of messages (added to the original final logging file)
+                            index_send_size = all_index_sbuffers[dst].nbytes
+                            index_recv_size = all_index_rbuffers[i].nbytes
+                            value_send_size = all_value_sbuffers[dst].nbytes
+                            value_recv_size = all_value_rbuffers[i].nbytes
+                            logger.info(f"ISEND_INDEX|rank={rank}|dest={dst}|tag=1|size={index_send_size}|size_mb={index_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_INDEX|rank={rank}|src={src}|tag=1|size={index_recv_size}|size_mb={index_recv_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"ISEND_VALUE|rank={rank}|dest={dst}|tag=2|size={value_send_size}|size_mb={value_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_VALUE|rank={rank}|src={src}|tag=2|size={value_recv_size}|size_mb={value_recv_size/1e6:.2f}|layer={new_name}")
                             reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
                             reqs.append(comm.Irecv([all_index_rbuffers[i], MPI.INT], source=src, tag=1))
                             reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
@@ -762,6 +802,15 @@ class AllReducer():
                             dst = dsts[j]
                             src = srcs[j]
                             #exchange buffer
+                            #logging to analize size of messages (added to the original final logging file)
+                            index_send_size = all_index_sbuffers[dst].nbytes
+                            index_recv_size = all_index_rbuffers[j].nbytes
+                            value_send_size = all_value_sbuffers[dst].nbytes
+                            value_recv_size = all_value_rbuffers[j].nbytes
+                            logger.info(f"ISEND_INDEX|rank={rank}|dest={dst}|tag=1|size={index_send_size}|size_mb={index_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_INDEX|rank={rank}|src={src}|tag=1|size={index_recv_size}|size_mb={index_recv_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"ISEND_VALUE|rank={rank}|dest={dst}|tag=2|size={value_send_size}|size_mb={value_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_VALUE|rank={rank}|src={src}|tag=2|size={value_recv_size}|size_mb={value_recv_size/1e6:.2f}|layer={new_name}")
                             reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
                             reqs.append(comm.Irecv([all_index_rbuffers[j], MPI.INT], source=src, tag=1))
                             reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
@@ -804,6 +853,9 @@ class AllReducer():
                         gvalues = reduced[gindexes]
                         #gindexes += region_offsets[rank]
                         send_size[0] = gvalues.size * 2
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        
                         comm.Allgather(send_size, recv_sizes)
 
                         offsets[1:] = recv_sizes[:-1]
@@ -815,7 +867,9 @@ class AllReducer():
                         send_buffer = np.zeros(send_size[0], dtype='float32')
                         send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                         send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
-
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        
                         comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                         all_gindexes = np.zeros(total_size//2, dtype='int32')
@@ -856,6 +910,9 @@ class AllReducer():
                             gindexes = np.nonzero(reduced)[0]
                             gvalues = reduced[gindexes]
                             send_size[0] = gvalues.size * 2
+                            
+                            #logging to analize size of messages (added to the original final logging file)
+                            
                             comm.Allgather(send_size, recv_sizes)
 
                             offsets[1:] = recv_sizes[:-1]
@@ -868,6 +925,8 @@ class AllReducer():
                             send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                             send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
 
+                            #logging to analize size of messages (added to the original final logging file)
+                            
                             comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                             all_gindexes = np.zeros(total_size//2, dtype='int32')
@@ -898,6 +957,10 @@ class AllReducer():
                         #gindexes += region_offsets[rank]
                         gvalues = gvalues.cpu().numpy()
                         send_size[0] = gvalues.size * 2
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        
+                        
                         comm.Allgather(send_size, recv_sizes)
 
                         offsets[1:] = recv_sizes[:-1]
@@ -1018,6 +1081,10 @@ class AllReducer():
                         ###elapse0 = time.time() - stime0
 
                         allgather_recv_buffer = np.zeros(total_size, dtype='float32')
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        send_buffer_size_bytes = send_buffer.nbytes
+                        logger.info(f"ALLGATHERV_FINAL|rank={rank}|size={send_buffer_size_bytes}|size_mb={send_buffer_size_bytes/1e6:.2f}|layer={new_name}")
                         comm.Allgatherv(send_buffer, [allgather_recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                         all_gindexes = np.zeros(total_size//2, dtype='int32')
@@ -1144,7 +1211,10 @@ class AllReducer():
                     kvalues = values.cpu().numpy()
                     send_size[0] = kvalues.size
                     local_topk_value = kvalues.size
-
+                    
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_size_bytes = send_size.nbytes
+                    logger.info(f"ALLGATHER_SENDSIZE|rank={rank}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgather(send_size, recv_sizes)
                     if rank == 0 and settings.PROFILING:
                         print("counter: ", self._allreduce_counter[new_name], "rank: ", rank, "local topk elements: ", local_topk_value, "localtopk threshold: ", local_threshold)
@@ -1157,6 +1227,11 @@ class AllReducer():
                     all_values = np.zeros(total_size, dtype='float32')
                     final_results = np.zeros(new_tensor.numel(), dtype='float32')
 
+                    #logging to analize size of messages (added to the original final logging file)
+                    kindexes_size_bytes = kindexes.nbytes
+                    kvalues_size_bytes = kvalues.nbytes
+                    logger.info(f"ALLGATHERV_INDEXES|rank={rank}|size={kindexes_size_bytes}|size_mb={kindexes_size_bytes/1e6:.2f}|layer={new_name}")
+                    logger.info(f"ALLGATHERV_VALUES|rank={rank}|size={kvalues_size_bytes}|size_mb={kvalues_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgatherv(kindexes, [all_indexes, recv_sizes, offsets, MPI.INT])
                     comm.Allgatherv(kvalues, [all_values, recv_sizes, offsets, MPI.FLOAT])
 
@@ -1221,6 +1296,10 @@ class AllReducer():
                         print("counter: ", self._allreduce_counter[new_name], "rank: ", rank, "local topk elements: ", ssizes.sum(), "localtopk threshold: ", local_threshold)
 
                     # transpose the send buffer sizes
+                    #logging to analize size of messages (added to the original final logging file)
+                    alltoall_send_bytes = ssizes.nbytes
+                    alltoall_recv_bytes = rsizes.nbytes
+                    logger.info(f"ALLTOALL_TOPKSA|rank={rank}|send_size={alltoall_send_bytes}|send_mb={alltoall_send_bytes/1e6:.2f}|recv_size={alltoall_recv_bytes}|recv_mb={alltoall_recv_bytes/1e6:.2f}|layer={new_name}")
                     comm.Alltoall(ssizes, rsizes)
                     total_red_size = rsizes.sum()
                     whole_value_rbuffers = np.zeros(total_red_size, dtype='float32')
@@ -1263,6 +1342,7 @@ class AllReducer():
                             all_index_rbuffers[i][:] = all_index_sbuffers[dst][:]
                         else:
                             #exchange buffer
+                            #logging to analize size of messages (added to the original final logging file)
                             reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
                             reqs.append(comm.Irecv([all_index_rbuffers[i], MPI.INT], source=src, tag=1))
                             reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
@@ -1276,6 +1356,7 @@ class AllReducer():
                             dst = dsts[j]
                             src = srcs[j]
                             #exchange buffer
+                            #logging to analize size of messages (added to the original final logging file)
                             reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
                             reqs.append(comm.Irecv([all_index_rbuffers[j], MPI.INT], source=src, tag=1))
                             reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
@@ -1340,6 +1421,8 @@ class AllReducer():
                         send_buffer = np.zeros(send_size[0], dtype='float32')
                         send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                         send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
+                        
+                        #logging to analize size of messages (added to the original final logging file)
 
                         comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
@@ -1368,6 +1451,9 @@ class AllReducer():
                         #    print("dense allgather rank: ", rank, "region_sizes: ", region_sizes, "region_offsets: ", region_offsets)
 
                         recv_buffer = np.zeros(tensor_size, dtype='float32')
+                        
+                        #logging to analize size of messages (added to the original final logging file)
+                        
                         comm.Allgatherv(reduced, [recv_buffer, region_sizes, region_offsets, MPI.FLOAT])
                         with torch.no_grad():
                             result = torch.from_numpy(recv_buffer).to(device=new_tensor.device) / num_workers
@@ -1455,6 +1541,10 @@ class AllReducer():
                     send_size = np.array([0], dtype='int32')
                     offsets = np.zeros(num_workers, dtype='int32')
                     send_size[0] = local_size
+                    
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_size_bytes = send_size.nbytes
+                    logger.info(f"ALLGATHER_SENDSIZE_GAUSSIANK|rank={rank}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgather(send_size, recv_sizes)
 
                     total_size = recv_sizes.sum() 
@@ -1466,6 +1556,11 @@ class AllReducer():
                     if rank == 0 and settings.PROFILING: 
                         print("counter: ", self._allreduce_counter[new_name], "rank: ", rank, "local topk elements: ", local_size, "global topk elements: ", total_size)
 
+                    #logging to analize size of messages (added to the original final logging file)
+                    local_topk_indexes_bytes = local_topk_indexes.nbytes
+                    local_topk_values_bytes = local_topk_values.nbytes
+                    logger.info(f"ALLGATHERV_INDEXES_GAUSSIANK|rank={rank}|size={local_topk_indexes_bytes}|size_mb={local_topk_indexes_bytes/1e6:.2f}|layer={new_name}")
+                    logger.info(f"ALLGATHERV_VALUES_GAUSSIANK|rank={rank}|size={local_topk_values_bytes}|size_mb={local_topk_values_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgatherv(local_topk_indexes, [all_indexes, recv_sizes, offsets, MPI.INT])
                     comm.Allgatherv(local_topk_values, [all_values, recv_sizes, offsets, MPI.FLOAT])
 
@@ -1500,6 +1595,10 @@ class AllReducer():
                     send_buffer = np.zeros(send_size[0], dtype='float32')
                     send_buffer[0 : send_size[0]//2] = local_topk_indexes.astype(np.int32)
                     send_buffer[send_size[0]//2 : send_size[0]] = local_topk_values.astype(np.float32)
+                    
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_size_bytes = send_size.nbytes
+                    logger.info(f"ALLGATHER_SENDSIZE_GAUSSIANKCONCAT|rank={rank}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgather(send_size, recv_sizes)
 
                     total_size = recv_sizes.sum() 
@@ -1507,6 +1606,10 @@ class AllReducer():
                     offsets = np.cumsum(offsets)
 
                     recv_buffer = np.zeros(total_size, dtype='float32')
+                    
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_buffer_size_bytes = send_buffer.nbytes
+                    logger.info(f"ALLGATHERV_GAUSSIANKCONCAT|rank={rank}|size={send_buffer_size_bytes}|size_mb={send_buffer_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
                     if rank == 0 and settings.PROFILING: 
                         print("counter: ", self._allreduce_counter[new_name], "rank: ", rank, "local topk elements: ", local_size, "global topk elements: ", total_size//2)
@@ -1562,6 +1665,8 @@ class AllReducer():
                             send_size[0] = values.size
                             
                             #exchange buffer size
+                            #logging to analize size of messages (added to the original final logging file)
+                            
                             comm.Isend([send_size, MPI.INT], dest=dst)
                             req = comm.Irecv([recv_size, MPI.INT], source=src)
 
@@ -1573,7 +1678,8 @@ class AllReducer():
                             #exchange buffer
                             recv_buffer = np.zeros(2*recv_size[0], dtype='float32')
 
-
+                            #logging to analize size of messages (added to the original final logging file)
+                            
                             req1 = comm.Isend([send_buffer, MPI.FLOAT], dest=dst)
                             req2 = comm.Irecv([recv_buffer, MPI.FLOAT], source=src)
                             req1.Wait()
@@ -1598,6 +1704,10 @@ class AllReducer():
                     gindexes += region_offset
                     gvalues = gvalues.cpu().numpy()
                     send_size[0] = gvalues.size * 2
+                    
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_size_bytes = send_size.nbytes
+                    logger.info(f"ALLGATHER_SENDSIZE_GAUSSIANKSA|rank={rank}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgather(send_size, recv_sizes)
 
                     offsets[1:] = recv_sizes[:-1]
@@ -1610,6 +1720,9 @@ class AllReducer():
                     send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                     send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
 
+                    #logging to analize size of messages (added to the original final logging file)
+                    send_buffer_size_bytes = send_buffer.nbytes
+                    logger.info(f"ALLGATHERV_GAUSSIANKSA|rank={rank}|size={send_buffer_size_bytes}|size_mb={send_buffer_size_bytes/1e6:.2f}|layer={new_name}")
                     comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                     all_gindexes = np.zeros(total_size//2, dtype='int32')

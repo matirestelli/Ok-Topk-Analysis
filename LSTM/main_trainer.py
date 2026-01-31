@@ -26,8 +26,35 @@ relative_path = None
 def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update, max_epochs, compression=False, compressor='topk', nwpernode=1, sigma_scale=2.5, pretrain=None, density=0.01, prefix=None):
     global relative_path
 
-    torch.cuda.set_device(dopt.rank()%nwpernode)
     rank = dopt.rank()
+    device_id = rank % nwpernode
+    
+    # MPI barrier to ensure all ranks initialized
+    comm = MPI.COMM_WORLD
+    comm.Barrier()
+    
+    # Stagger GPU access to avoid conflicts with MIG mode
+    import time
+    time.sleep(rank * 0.5)
+    
+    try:
+        torch.cuda.set_device(device_id)
+        if rank == 0:
+            logger.info(f"Successfully set CUDA device {device_id}")
+    except RuntimeError as e:
+        logger.error(f"Rank {rank}: Failed to set device {device_id}: {e}")
+        # Try alternate device allocation
+        import subprocess
+        try:
+            result = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True)
+            available_gpus = len(result.stdout.strip().split('\n'))
+            logger.info(f"Rank {rank}: Available GPUs: {available_gpus}")
+            # Try device 0 as fallback
+            torch.cuda.set_device(0)
+            logger.info(f"Rank {rank}: Fallback to device 0 succeeded")
+        except Exception as e2:
+            logger.error(f"Rank {rank}: Fallback failed: {e2}")
+            raise
     if rank != 0:
         pretrain = None
 
