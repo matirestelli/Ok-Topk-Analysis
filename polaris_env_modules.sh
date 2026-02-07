@@ -1,17 +1,24 @@
 #!/bin/bash
 # Polaris-specific environment module loader
 # Source this file in your job scripts or call directly before running training
-# This sets up modules and activates the conda environment created by setup_polaris_env.sh
+# This sets up modules and activates a conda environment
+#
+# Usage:
+#   source polaris_env_modules.sh              # Activates py38_oktopk (default, MPI code)
+#   CONDA_ENV=py310_nccl source polaris_env_modules.sh  # Activates py310_nccl (NCCL code)
 
 # Load required Polaris modules (must come before activating conda env)
-module load cuda/11.8 || module load cuda/12.9
+module load cuda/12.9 || module load cuda/11.8
 module load craype-accel-nvidia80 2>/dev/null || module load craype-accel-nvidia70 2>/dev/null || true
 module load cray-pals
 # Activate Miniconda and the conda environment
-# (created by setup_polaris_env.sh)
+# (created by setup_polaris_env.sh or setup script)
 MINICONDA_DIR="$HOME/miniconda3"
 source "$MINICONDA_DIR/etc/profile.d/conda.sh"
-conda activate py38_oktopk
+
+# Default to py38_oktopk (MPI), but allow override via CONDA_ENV environment variable
+CONDA_ENV=${CONDA_ENV:-py38_oktopk}
+conda activate "$CONDA_ENV"
 
 # Install required packages if missing
 pip install psutil --quiet 2>/dev/null || true

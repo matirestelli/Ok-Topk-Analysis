@@ -19,17 +19,13 @@ else:
 
 
 class _DistributedOptimizer(torch.optim.Optimizer):
-    def __init__(self, params, named_parameters, compressor, is_sparse=True, err_handler=None, layerwise_times=None, sigma_scale=2.5, density=0.01, norm_clip=None, writer=None, timing_logger=None):
+    def __init__(self, params, named_parameters, compressor, is_sparse=True, err_handler=None, layerwise_times=None, sigma_scale=2.5, density=0.01, norm_clip=None, writer=None):
         super(self.__class__, self).__init__(params)
         self._compressor= compressor 
         self._sparse = is_sparse 
         self._layerwise_times = layerwise_times
         self._msg_queue = Queue.Queue()
         self._msg_queue2 = Queue.Queue()
-        # new parameters for timing logging
-        self._timing_logger = timing_logger
-        self._current_iteration = 0
-        self._current_epoch = 0
 
         if named_parameters is not None:
             named_parameters = list(named_parameters)
@@ -59,7 +55,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._key_lock = threading.Lock()
         self.momentum_correction = False
         # fixes made: Pass trainer=None to AllReducer for later initialization
-        self._allreducer = ar.AllReducer(named_parameters, self._lock, self._key_lock, compressor, sparse=self._sparse, err_callback=err_handler, layerwise_times=layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, msg_queue=self._msg_queue, msg_queue2=self._msg_queue2, writer=writer, trainer=None, timing_logger=timing_logger)
+        self._allreducer = ar.AllReducer(named_parameters, self._lock, self._key_lock, compressor, sparse=self._sparse, err_callback=err_handler, layerwise_times=layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, msg_queue=self._msg_queue, msg_queue2=self._msg_queue2, writer=writer, trainer=None)
         self.allreducer_thread = threading.Thread(name='allreducer', target=self._allreducer.run)
         self.allreducer_thread.start()
         self.local = False
@@ -70,19 +66,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         """Set trainer reference for metrics tracking"""
         if self._allreducer is not None:
             self._allreducer._trainer = trainer
-            
-    # ADDING tracking of epoch and iteratin for timing logging
-    def set_current_iteration(self, iteration):
-    """Set current iteration for timing logs"""
-    self._current_iteration = iteration
-    if self._allreducer is not None:
-        self._allreducer._current_iteration = iteration
-
-    def set_current_epoch(self, epoch):
-        """Set current epoch for timing logs"""
-        self._current_epoch = epoch
-        if self._allreducer is not None:
-            self._allreducer._current_epoch = epoch
 
     def _register_hooks(self):
         for param_group in self.param_groups:
@@ -226,11 +209,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return self._allreducer.get_current_density()
 
 
-def DistributedOptimizer(optimizer, named_parameters=None, compression=NoneCompressor, is_sparse=False, err_handler=None, layerwise_times=None, sigma_scale=2.5, density=0.1, norm_clip=None, writer=None, timing_logger=None):
+def DistributedOptimizer(optimizer, named_parameters=None, compression=NoneCompressor, is_sparse=False, err_handler=None, layerwise_times=None, sigma_scale=2.5, density=0.1, norm_clip=None, writer=None):
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
 
-    return cls(optimizer.param_groups, named_parameters, compression, is_sparse, err_handler, layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, writer=writer, timing_logger=timing_logger)
+    return cls(optimizer.param_groups, named_parameters, compression, is_sparse, err_handler, layerwise_times, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, writer=writer)
 
 def rank():
     return MPI.COMM_WORLD.rank

@@ -15,7 +15,6 @@ comm.Set_errhandler(MPI.ERRORS_RETURN)
 
 from dl_trainer import DLTrainer, _support_datasets, _support_dnns
 from compression import compressors
-from timing_logger import init_timing_logger, shutdown_timing_logger
 
 from settings import logger, formatter
 #import horovod.torch as hvd
@@ -27,13 +26,8 @@ relative_path = None
 def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update, max_epochs, compression=False, compressor='topk', nwpernode=1, sigma_scale=2.5, pretrain=None, density=0.01, prefix=None):
     global relative_path
 
-    # assign each rank to a device on a node
-    # examlple 2 nodes: rank 0 -> GPU0 N0 rank 1 -> GPU1 N0 rank 2 -> GPU0 N1 rank 3 -> GPU1 N1 
     rank = dopt.rank()
     device_id = rank % nwpernode
-    
-    # Initialize timing logger for MPI communication measurements
-    timing_logger = init_timing_logger(rank, './logs/timing')
     
     # MPI barrier to ensure all ranks initialized
     comm = MPI.COMM_WORLD
@@ -82,19 +76,7 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
 
     logger.info('Broadcast parameters....')
     #print("rank: ", rank, "before bcast model_state: ", trainer.net.state_dict())
-    
-    # Calculate and log the model size
-    import io
-    if rank == 0:
-        buffer = io.BytesIO()
-        torch.save(trainer.net.state_dict(), buffer)
-        model_size_mb = buffer.tell() / (1024 * 1024)
-        logger.info('Model parameters size: %.2f MB', model_size_mb)
-    
-    # Measure parameter broadcast communication
-    with timing_logger.record_mpi_operation('BCAST', message_size_bytes=0, layer_name='model_params', phase='initialization', iteration=0, epoch=0):
-        model_state = comm.bcast(trainer.net.state_dict(), root=0)
-    
+    model_state = comm.bcast(trainer.net.state_dict(), root=0)
     #print("rank: ", rank, "model_state: ", model_state)
     trainer.net.load_state_dict(model_state)
     comm.Barrier()
@@ -110,7 +92,7 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
     logger.info('Broadcast parameters finished....')
 
     norm_clip = None
-    optimizer = dopt.DistributedOptimizer(trainer.optimizer, trainer.net.named_parameters(), compression=compressor, is_sparse=is_sparse, err_handler=_error_handler, layerwise_times=None, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, writer=writer, timing_logger=timing_logger)
+    optimizer = dopt.DistributedOptimizer(trainer.optimizer, trainer.net.named_parameters(), compression=compressor, is_sparse=is_sparse, err_handler=_error_handler, layerwise_times=None, sigma_scale=sigma_scale, density=density, norm_clip=norm_clip, writer=writer)
 
     trainer.update_optimizer(optimizer)
     # fixes made: Initialize trainer reference in distributed optimizer for metrics tracking
@@ -123,8 +105,6 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
 
     iters_per_epoch = trainer.get_num_of_training_samples() // (nworkers * batch_size * nsteps_update)
 
-
-    # MAIN TRAINING LOOP
     times = []
     NUM_OF_DISLAY = 20
     display = NUM_OF_DISLAY if iters_per_epoch > NUM_OF_DISLAY else iters_per_epoch-1
@@ -135,34 +115,22 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
             hidden = trainer.net.init_hidden()
         for i in range(iters_per_epoch):
             s = time.time()
-            
-             # Set iteration and epoch metadata for timing logs
-            optimizer.set_current_iteration(epoch * iters_per_epoch + i)
-            optimizer.set_current_epoch(epoch)
-
-            # clean gradients from last operation
             optimizer.zero_grad()
             for j in range(nsteps_update):
-                # nsteps_update = how many training steps before doing AllReduce communication
                 if j < nsteps_update - 1 and nsteps_update > 1:
-                    # For the FIRST nsteps_update-1 steps, AllReduce is disabled (keep gradients local, just accumulate)
                     optimizer.local = True
                 else:
-                    # On the LAST step, AllReduce is enabled (ready to communicate)
                     optimizer.local = False
                 if dnn == 'lstm':
-                    # does forward pass, backward pass, computes gradients
                     _, hidden = trainer.train(1, hidden=hidden)
                 else:
                     trainer.train(1)
             if dnn == 'lstm':
-                # Waits for AllReducer communication to finish (background thread)
                 optimizer.synchronize()
                 torch.nn.utils.clip_grad_norm_(trainer.net.parameters(), 0.25)
             elif dnn == 'lstman4':
                 optimizer.synchronize()
                 torch.nn.utils.clip_grad_norm_(trainer.net.parameters(), 400)
-            #  applies gradient updates to model parameters
             trainer.update_model()
             times.append(time.time()-s)
             if i % display == 0 and i > 0 and rank == 0: 
@@ -204,11 +172,6 @@ def robust_ssgd(dnn, dataset, data_dir, nworkers, lr, batch_size, nsteps_update,
             # For comparison purpose <=== End
         optimizer._allreducer._profiling_norms = []
     optimizer.stop()
-    
-     # Shutdown timing logger
-    shutdown_timing_logger()
-    if rank == 0:
-        logger.info('Training complete. Timing logs written to ./logs/timing/timing-rank*.csv')
 
 
 if __name__ == '__main__':

@@ -143,45 +143,6 @@
 
 ---
 
-## Sparse Phase Collective Operations
-
-The sparse phase (iterations 128+) uses multiple MPI collectives for efficient sparse gradient exchange:
-
-| Collective | Operations | Message Size | Purpose |
-|-----------|-----------|--------------|---------|
-| **ALLGATHERV_FINAL** | 88 | 0.35-5.96 MB avg | Gather sparse gradients from all ranks |
-| **ISEND_INDEX** | 672 | 0.45 MB avg | Send sparse gradient indices to other ranks |
-| **IRECV_INDEX** | 672 | 0.45 MB avg | Receive sparse gradient indices from other ranks |
-| **ISEND_VALUE** | 672 | 0.45 MB avg | Send sparse gradient values to other ranks |
-| **IRECV_VALUE** | 672 | 0.45 MB avg | Receive sparse gradient values from other ranks |
-| **ALLTOALL** | 96 | Metadata | Exchange sparse message sizes |
-
-**Communication Pattern:**
-1. **ALLTOALL** (96 ops) - Exchange sizes between ranks
-2. **ISEND/IRECV** (2,688 ops) - Point-to-point gradient indices and values
-3. **ALLGATHERV_FINAL** (88 ops) - Final collective gather of sparse gradients
-
-**Contrast with Dense Phase:**
-- **Dense:** Single synchronous AllReduce (simple, one collective per iteration)
-- **Sparse:** Mixed collectives (Alltoall + P2P messaging + AllGatherV) for selective gradient exchange
-
----
-
-## Communication Overhead Breakdown: Dense vs Sparse
-
-| Collective Type | Operations | Message Size | Total Data | Time (sec) | % of Total |
-|-----------------|-----------|--------------|-----------|-----------|-----------|
-| **ALLREDUCE_DENSE** | 1,024 | 110.28 MB | 110.28 GB | 4.41 | **98.1%** |
-| ALLGATHERV_FINAL | 88 | 1.48 MB avg | 0.127 GB | 0.005 | 0.11% |
-| ISEND/IRECV (INDEX) | 672 | 0.45 MB avg | 0.302 GB | 0.012 | 0.27% |
-| ISEND/IRECV (VALUE) | 672 | 0.45 MB avg | 0.302 GB | 0.012 | 0.27% |
-| ALLTOALL | 96 | Metadata | ~0 GB | <0.001 | <0.1% |
-| **TOTAL** | **3,808** | - | **111.0 GB** | **4.50** | **100%** |
-
-**Key Insight:** The dense phase (ALLREDUCE_DENSE) contributes **98.1% of all communication time** despite running for only 128 iterations, because each message is 110.28 MB. The sparse phase, while using more complex collectives, contributes only **0.11%** due to much smaller message sizes (1.48 MB average).
-
----
-
 ## Key Findings
 
 ### 1. Dense Warmup Phase (0-128 iterations)

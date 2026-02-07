@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# version where all the mpi communication are substituted with nccl primitive uing nccl4py
+
 from __future__ import print_function
 
 import numpy as np
@@ -8,6 +10,7 @@ import logging
 import utils
 import settings
 from mpi4py import MPI
+import nccl4py  # nccl4py mapping: GPU-native collective communications
 from settings import logger
 import sys
 import math
@@ -36,75 +39,57 @@ def intersect1d_searchsorted(A, B_ar):
     idx[idx==len(B_ar)] = 0
     return A[B_ar[idx] == A]
 
-def topk_sparse_allreduce(comm, sparse_tensor, storage, indexes=None, dtype=np.float32, iming_logger=None, layer_name=None, iteration=0, epoch=0):
+def topk_sparse_allreduce(comm, sparse_tensor, storage, indexes=None, dtype=torch.float32):
+    # nccl4py mapping: MPI_Allgather -> all_gather (GPU-resident, no numpy conversion)
     tensor = sparse_tensor
     if indexes is None:
-        k = int(tensor.size * 0.01)
-        indexes, values = utils.topk(tensor, k)
+        k = int(tensor.numel() * 0.01)
+        _, indexes = torch.topk(torch.abs(tensor), k)
+        values = tensor[indexes]
     else:
-        if not (type(indexes) is np.ndarray):
-            indexes = indexes.cpu().numpy().astype(np.uint32)
         k = len(indexes)
-        values = tensor#[indexes] 
+        values = tensor[indexes]
 
     num_workers = comm.size
-    if storage is not None and 'values_1d' in storage:
-        values_1d = storage['values_1d']
-        indexes_1d = storage['indexes_1d']
-        result = storage['result']
-    else:
-        values_1d = np.zeros(k * num_workers, dtype=np.float32)
-        indexes_1d = np.zeros(k * num_workers, dtype=np.uint32)
-        result = np.zeros_like(tensor) 
-        storage['values_1d'] = values_1d
-        storage['indexes_1d'] = indexes_1d
-        storage['result'] = result
-        
-    if dtype != np.float32:
-        values_1d = values_1d.astype(dtype)
-
-    result.fill(0)
-
-    if len(indexes) == 0:
-        return result, None
-
     nnz = k
-   
-   # with no profiling
-    #comm.Allgather(values, values_1d[:num_workers*nnz])
-    #comm.Allgather(indexes, indexes_1d[:num_workers*nnz])
     
-    #timing profiling of communication
-    if timing_logger is not None:
-        with timing_logger.record_mpi_operation('ALLGATHER_VALUES', 
-                                                 message_size_bytes=values.nbytes,
-                                                 layer_name=layer_name,
-                                                 phase='sparse',
-                                                 iteration=iteration,
-                                                 epoch=epoch):
-            comm.Allgather(values, values_1d[:num_workers*nnz])
-    else:
-        comm.Allgather(values, values_1d[:num_workers*nnz])
+    # Keep everything on GPU - no numpy!
+    values_gathered = torch.zeros(k * num_workers, dtype=dtype, device=tensor.device)
+    indexes_gathered = torch.zeros(k * num_workers, dtype=torch.int32, device=tensor.device)
     
-    if timing_logger is not None:
-        with timing_logger.record_mpi_operation('ALLGATHER_INDEXES',
-                                                 message_size_bytes=indexes.nbytes,
-                                                 layer_name=layer_name,
-                                                 phase='sparse',
-                                                 iteration=iteration,
-                                                 epoch=epoch):
-            comm.Allgather(indexes, indexes_1d[:num_workers*nnz])
-    else:
-        comm.Allgather(indexes, indexes_1d[:num_workers*nnz])
-        
-    return values_1d, indexes_1d, None #result, None
+    # Logging
+    values_size_bytes = values.numel() * values.element_size()
+    indexes_size_bytes = indexes.numel() * 4
+    logger.info(f"ALLGATHER_VALUES|size={values_size_bytes}|size_mb={values_size_bytes/1e6:.2f}")
+    logger.info(f"ALLGATHER_INDEXES|size={indexes_size_bytes}|size_mb={indexes_size_bytes/1e6:.2f}")
+    
+    stream = nccl4py.get_stream()
+    
+    # nccl4py AllGather - values
+    comm.all_gather(sendbuf=values.data_ptr(), 
+                   recvbuf=values_gathered.data_ptr(),
+                   count=nnz, 
+                   datatype='float32', 
+                   stream=stream)
+    
+    # nccl4py AllGather - indexes
+    comm.all_gather(sendbuf=indexes.data_ptr(), 
+                   recvbuf=indexes_gathered.data_ptr(),
+                   count=nnz, 
+                   datatype='int32', 
+                   stream=stream)
+    
+    stream.synchronize()
+    
+    # Return GPU tensors directly - no conversion!
+    return values_gathered, indexes_gathered, None
 
 
 def topk(tensor, k):
     indexes = np.abs(tensor).argsort()[-k:][::-1]
     return indexes, tensor[indexes]
 
-def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtype=np.float32,  timing_logger=None, layer_name=None, iteration=0, epoch=0):
+def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtype=np.float32):
     """
     0: 0(0) <- 1(1), 2(2) <- 3(3), 4(4) <- 5(5), 6(6) <- 7(7)
     1: 0(0) <- 2(1), 4(2) <- 6(3)
@@ -151,20 +136,11 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
             local_rank = participate_ranks.index(rank)
             if local_rank % 2 == 0:
                 source = participate_ranks[local_rank+1]
+                #logging to analize size of messages (added to the original final logging file)
+                recv_size_bytes = recv_values.nbytes
+                logger.info(f"RECV|to_rank={rank}|from_rank={source}|size={recv_size_bytes}|size_mb={recv_size_bytes/1e6:.2f}|round={i}|layer={layer_name}")
                 
-                # profiling for communication time
-                if timing_logger is not None:
-                    with timing_logger.record_mpi_operation('RECV',
-                                                             message_size_bytes=recv_values.nbytes,
-                                                             layer_name=layer_name,
-                                                             phase='sparse',
-                                                             iteration=iteration,
-                                                             epoch=epoch):
-                        comm.Recv([recv_values, MPI.FLOAT], source=source)
-                else:
-                    comm.Recv([recv_values, MPI.FLOAT], source=source)
-                    
-                #comm.Recv([recv_values, MPI.FLOAT], source=source)
+                comm.Recv([recv_values, MPI.FLOAT], source=source)
                 #reqr = comm.Irecv([recv_values, MPI.FLOAT], source=source)
                 #reqr.Wait()
                 tmp_indexes = recv_values[0:k].astype(np.int32)
@@ -187,19 +163,11 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
             else:
                 target = participate_ranks[local_rank-1]
                 logger.debug('[round:%d], %d(%d)->%d(%d)', i, rank, local_rank, target, local_rank-1)
+                #logging to analize size of messages (added to the original final logging file)
+                send_size_bytes = send_values.nbytes
+                logger.info(f"SEND|from_rank={rank}|to_rank={target}|size={send_size_bytes}|size_mb={send_size_bytes/1e6:.2f}|round={i}|layer={layer_name}")
                 
-                #comm.Send([send_values, MPI.FLOAT], dest=target)
-                # profilig communication time
-                if timing_logger is not None:
-                    with timing_logger.record_mpi_operation('SEND',
-                                                             message_size_bytes=send_values.nbytes,
-                                                             layer_name=layer_name,
-                                                             phase='sparse',
-                                                             iteration=iteration,
-                                                             epoch=epoch):
-                        comm.Send([send_values, MPI.FLOAT], dest=target)
-                else:
-                    comm.Send([send_values, MPI.FLOAT], dest=target)
+                comm.Send([send_values, MPI.FLOAT], dest=target)
                 #reqs = comm.Isend([send_values, MPI.FLOAT], dest=target)
                 #reqs.Wait()
         exist_workers /= 2
@@ -215,20 +183,7 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
         send_values[k:2*k] = values
     else:
         send_values = recv_values[0:2*k]
-    
-    #profiling communication time
-    #comm.Bcast(send_values, root=0)
-     if timing_logger is not None:
-        with timing_logger.record_mpi_operation('BCAST',
-                                                 message_size_bytes=send_values.nbytes,
-                                                 layer_name=layer_name,
-                                                 phase='sparse',
-                                                 iteration=iteration,
-                                                 epoch=epoch):
-            comm.Bcast(send_values, root=0)
-    else:
-        comm.Bcast(send_values, root=0)
-        
+    comm.Bcast(send_values, root=0)
     tensor.fill(0.)
     if rank != 0:
         tmp_indexes = send_values[0:k].astype(np.uint32)
@@ -241,24 +196,26 @@ def gtopk_sparse_allreduce(comm, sparse_tensor, storage=None, indexes=None, dtyp
     return values, indexes, included_indexes # final selected values and indexes
 
 
-def dense_allreduce(comm, tensor, timing_logger=None, layer_name=None, iteration=0, epoch=0):
-    result = np.zeros_like(tensor)
-    op = MPI.SUM
+def dense_allreduce(comm, tensor):
+    # nccl4py mapping: MPI_Allreduce -> all_reduce (GPU-resident)
+    assert tensor.is_cuda, "Tensor must be on GPU for nccl4py"
     
-    #profiling communication times        
-    #comm.Allreduce(tensor, result, op)
-     if timing_logger is not None:
-        with timing_logger.record_mpi_operation('ALLREDUCE_DENSE',
-                                                 message_size_bytes=tensor.nbytes,
-                                                 layer_name=layer_name,
-                                                 phase='dense',
-                                                 iteration=iteration,
-                                                 epoch=epoch):
-            comm.Allreduce(tensor, result, op)
-    else:
-        comm.Allreduce(tensor, result, op)
-        
-    comm.Barrier()
+    tensor_size_bytes = tensor.numel() * tensor.element_size()
+    rank = comm.rank
+    num_workers = comm.size
+    logger.info(f"ALLREDUCE_DENSE|rank={rank}|size={tensor_size_bytes}|size_mb={tensor_size_bytes/1e6:.2f}|num_workers={num_workers}")
+    
+    result = torch.zeros_like(tensor)
+    stream = nccl4py.get_stream()
+    
+    comm.all_reduce(sendbuf=tensor.data_ptr(), 
+                   recvbuf=result.data_ptr(),
+                   count=tensor.numel(), 
+                   datatype='float32', 
+                   op='sum', 
+                   stream=stream)
+    stream.synchronize()
+    
     return result
 
 def _default_err_callback(new_num_workers, new_rank):
@@ -272,7 +229,7 @@ def force_insert_item(d, key, val):
 
 class AllReducer():
     # fixes made: Added trainer parameter to constructor for metrics tracking
-    def __init__(self, named_parameters, lock, key_lock, compression, sparse=False, err_callback=None, layerwise_times=None, sigma_scale=2.5, density=0.001, train_epoch=0, norm_clip=None, msg_queue=None, msg_queue2=None, writer=None, trainer=None, timing_logger=None):
+    def __init__(self, named_parameters, lock, key_lock, compression, sparse=False, err_callback=None, layerwise_times=None, sigma_scale=2.5, density=0.001, train_epoch=0, norm_clip=None, msg_queue=None, msg_queue2=None, writer=None, trainer=None):
         self._running = False 
         self._msg_queue = msg_queue
         self._msg_queue2 = msg_queue2
@@ -296,9 +253,6 @@ class AllReducer():
         self._norm_dict = {}
         self._local_topk_dict = {}
         self._global_topk_dict = {}
-        self._timing_logger = timing_logger
-        self._current_iteration = 0
-        self._current_epoch = 0
 
         logger.info('density: %f', self._density)
         logger.info('threshold scale: %f', self._scale)
@@ -458,18 +412,75 @@ class AllReducer():
     def allocate_sparse_storages(self):
         for k, v in self._merged_parameters.items():
             self.allocate_storage(k, v)
-    
-    # new methods added for timing profiling of communications
-    def set_current_iteration(self, iteration):
-        """Set current training iteration for timing context"""
-        self._current_iteration = iteration
-    
-    def set_current_epoch(self, epoch):
-        """Set current training epoch for timing context"""
-        self._current_epoch = epoch
+
+
+    def _print_profiling(self):
+        if self._profiling and self.rank() == 0 and len(self._allreduce_timers.keys()) > 0 and len(self._allreduce_timers.get(list(self._allreduce_timers.keys())[0], [])) == 50:
+            cts = self._layerwise_times # gpu computation
+            mgs = self._merge_timers # merge_times
+            #if self._compression.name in ['topkA', 'topkA2', 'gtopk'] and len(self._compression_timers) != 0:
+            if len(self._compression_timers) != 0:
+                cps = self._compression_timers # compression
+            ars = self._allreduce_timers # allreduce times
+            dms = self._demerge_timers# demerge times
+            d2hs = self._d2h_times
+            h2ds = self._h2d_times
+            l = 0
+            logger.info('[rank:%d]name[size]: backward, merge, compression, allreduce, demerge, d2h, h2d')
+            total_sz = 0
+            total_ct = 0.0
+            total_mg = 0.0
+            total_cp = 0.0
+            total_ar = 0.0
+            total_dm = 0.0
+            total_d2h = 0.0
+            total_h2d = 0.0
+
+            for g in self._groups:
+                ct = 0.0
+                sz = 0
+                for k in g:
+                    if cts is not None:
+                        ct += cts[l]
+                    else:
+                        ct = 0.0
+                    sz += self._sizes[l]
+                    total_ct += ct
+                    l += 1
+                total_sz += sz
+                k = ':'.join(g)
+                mg = np.mean(mgs[k])
+                total_mg += mg
+                if len(self._compression_timers) != 0:
+                    cp = np.mean(cps[k])
+                    total_cp += cp
+                ar = np.mean(ars[k])
+                total_ar += ar
+                dm = np.mean(dms[k])
+                total_dm += dm
+                d2h = np.mean(d2hs.get(k, [0.0]))
+                total_d2h += d2h
+                h2d = np.mean(h2ds.get(k, [0.]))
+                total_h2d += h2d
+
+                if len(self._compression_timers) != 0:
+                    logger.info('[rank:%d]%s[%d]: %f,%f,%f,%f,%f,%f,%f', self.rank(), k[0:3]+'...'+k[-3:], sz, ct,mg,cp,ar,dm,d2h,h2d)
+                else:
+                    logger.info('[rank:%d]%s[%d]: %f,%f,%f,%f,%f,%f', self.rank(), k[0:3]+'...'+k[-3:], sz, ct,mg,ar,dm,d2h,h2d)
+                #logger.info('[rank:%d]%s[%d]: %f,%f,%f,%f,%f,%f', self.rank(), k[0:3]+'...'+k[-3:], sz, ct,mg,ar,dm,d2h,h2d)
+                mgs.pop(k, None)
+
+                if len(self._compression_timers) != 0:
+                    cps.pop(k, None)
+                ars.pop(k, None)
+                dms.pop(k, None)
+                d2hs.pop(k, None)
+                h2ds.pop(k, None)
+            logger.info('[rank:%d]%s[%d]: %f,%f,%f,%f,%f,%f,%f', self.rank(), 'total', total_sz, total_ct,total_mg,total_cp,total_ar,total_dm,total_d2h,total_h2d)
 
     def reset(self):
         self._for_reductions = self._default_for_reductions.copy()
+        self._print_profiling()
 
     def add_tensor(self, name, tensor):
         if name in self._entries:
@@ -507,7 +518,7 @@ class AllReducer():
         self._sparse_storages_topk[name] = {}
         
 
-    def _sparse_allreduce(self, name, tensor, selected_tensor, original_shape, topk_indexes=None, timing_logger=None, layer_name=None, iteration=0, epoch=0):
+    def _sparse_allreduce(self, name, tensor, selected_tensor, original_shape, topk_indexes=None):
         stime = time.time()
         ct = selected_tensor
         if ct.is_cuda: # only transfer the selected k values through PCI-e
@@ -558,7 +569,7 @@ class AllReducer():
             force_insert_item(self._h2d_times, name, time.time()-stime)
         return tensor, included_indexes, full_mean
 
-    def _dense_allreduce(self, name, tensor, timing_logger=None, layer_name=None, iteration=0, epoch=0):
+    def _dense_allreduce(self, name, tensor):
         ct = tensor 
         shape = tensor.shape
         if ct.is_cuda:
@@ -605,9 +616,7 @@ class AllReducer():
                     logger.info('DEBUG counter[%s]=%d (sparse=%s, sparse_name=%s)', new_name[:20], self._allreduce_counter[new_name], self._sparse, self._compression.name if self._sparse else 'N/A')
                 
                 if self._allreduce_counter[new_name] < 128:
-                    result = self._dense_allreduce(new_name, new_tensor, timing_logger=self._timing_logger, layer_name=new_name, iteration=self._current_iteration, epoch=self._current_epoch)
-                    #result = self._dense_allreduce(new_name, new_tensor)
-                    #profiling for time of communications
+                    result = self._dense_allreduce(new_name, new_tensor)
                 elif self._sparse and self._compression.name == 'oktopk':
                     cstime = time.time()
                     local_threshold_recompute_interval = 32
@@ -618,7 +627,7 @@ class AllReducer():
                     #region_repartition_interval = 64
 
                     if settings.PROFILING_NORM:
-                        dense_all_grads = self._dense_allreduce(new_name, new_tensor, timing_logger=self._timing_logger, layer_name=new_name, iteration=self._current_iteration, epoch=self._current_epoch)
+                        dense_all_grads = self._dense_allreduce(new_name, new_tensor)
                         #grad_norm = new_tensor.norm(p=2).item()
                         grad_norm = dense_all_grads.norm(p=2).item()
 
@@ -635,7 +644,7 @@ class AllReducer():
 
                     if settings.PROFILING_NORM:
                         residuals = self._compression.get_residuals(new_name, new_tensor)
-                        dense_result = self._dense_allreduce(new_name, residuals, timing_logger=self._timing_logger, layer_name=new_name, iteration=self._current_iteration, epoch=self._current_epoch)
+                        dense_result = self._dense_allreduce(new_name, residuals)
                         #grad_norm = dense_result.norm(p=2).item()
                         dense_values, dense_indexes = torch.topk(torch.abs(dense_result.data), k=topk_value)
                         global_topk_tensor = torch.zeros_like(residuals.data)
@@ -675,16 +684,7 @@ class AllReducer():
                         region_boundaries_size_bytes = region_boundaries.nbytes
                         logger.info(f"ALLREDUCE_REGION|rank={rank}|size={region_boundaries_size_bytes}|size_mb={region_boundaries_size_bytes/1e6:.2f}|layer={new_name}")
                 
-                        if self._timing_logger is not None:
-                            with self._timing_logger.record_mpi_operation(operation='ALLREDUCE_REGION',
-                                                                          message_size_bytes=region_boundaries.nbytes,
-                                                                          layer_name=new_name,
-                                                                          phase='sparse',
-                                                                          iteration=self._current_iteration,
-                                                                          epoch=self._current_epoch):
-                                comm.Allreduce(region_boundaries, global_boundaries, MPI.SUM)
-                        else:
-                            comm.Allreduce(region_boundaries, global_boundaries, MPI.SUM)
+                        comm.Allreduce(region_boundaries, global_boundaries, MPI.SUM)
                         global_boundaries //= num_workers
 
                         for i in range(num_workers):
@@ -751,16 +751,7 @@ class AllReducer():
                     alltoall_recv_bytes = rsizes.nbytes
                     logger.info(f"ALLTOALL|rank={rank}|send_size={alltoall_send_bytes}|send_mb={alltoall_send_bytes/1e6:.2f}|recv_size={alltoall_recv_bytes}|recv_mb={alltoall_recv_bytes/1e6:.2f}|layer={new_name}")
                 
-                    if self._timing_logger is not None:
-                        with self._timing_logger.record_mpi_operation(operation='ALLTOALL',
-                                                                      message_size_bytes=alltoall_send_bytes + alltoall_recv_bytes,
-                                                                      layer_name=new_name,
-                                                                      phase='sparse',
-                                                                      iteration=self._current_iteration,
-                                                                      epoch=self._current_epoch):
-                            comm.Alltoall(ssizes, rsizes)
-                    else:
-                        comm.Alltoall(ssizes, rsizes)
+                    comm.Alltoall(ssizes, rsizes)
                     total_red_size = rsizes.sum()
                     whole_value_rbuffers = np.zeros(total_red_size, dtype='float32')
                     whole_index_rbuffers = np.zeros(total_red_size, dtype='int32')
@@ -802,27 +793,19 @@ class AllReducer():
                             all_index_rbuffers[i][:] = all_index_sbuffers[dst][:]
                         else:
                             #exchange buffer
-                            #profiling for time of communications
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ISEND_INDEX', message_size_bytes=index_send_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
-                            else:
-                                reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='IRECV_INDEX', message_size_bytes=index_recv_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Irecv([all_index_rbuffers[i], MPI.INT], source=src, tag=1))
-                            else:
-                                reqs.append(comm.Irecv([all_index_rbuffers[i], MPI.INT], source=src, tag=1))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ISEND_VALUE', message_size_bytes=value_send_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
-                            else:
-                                reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='IRECV_VALUE', message_size_bytes=value_recv_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Irecv([all_value_rbuffers[i], MPI.FLOAT], source=src, tag=2))
-                            else:
-                                reqs.append(comm.Irecv([all_value_rbuffers[i], MPI.FLOAT], source=src, tag=2))
+                            #logging to analize size of messages (added to the original final logging file)
+                            index_send_size = all_index_sbuffers[dst].nbytes
+                            index_recv_size = all_index_rbuffers[i].nbytes
+                            value_send_size = all_value_sbuffers[dst].nbytes
+                            value_recv_size = all_value_rbuffers[i].nbytes
+                            logger.info(f"ISEND_INDEX|rank={rank}|dest={dst}|tag=1|size={index_send_size}|size_mb={index_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_INDEX|rank={rank}|src={src}|tag=1|size={index_recv_size}|size_mb={index_recv_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"ISEND_VALUE|rank={rank}|dest={dst}|tag=2|size={value_send_size}|size_mb={value_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_VALUE|rank={rank}|src={src}|tag=2|size={value_recv_size}|size_mb={value_recv_size/1e6:.2f}|layer={new_name}")
+                            reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
+                            reqs.append(comm.Irecv([all_index_rbuffers[i], MPI.INT], source=src, tag=1))
+                            reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
+                            reqs.append(comm.Irecv([all_value_rbuffers[i], MPI.FLOAT], source=src, tag=2))
                     MPI.Request.Waitall(reqs)
 
                     # communicate for the following chunk with computation overlapping
@@ -832,27 +815,19 @@ class AllReducer():
                             dst = dsts[j]
                             src = srcs[j]
                             #exchange buffer
-                            # profiling for time of communications
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ISEND_INDEX', message_size_bytes=index_send_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
-                            else:
-                                reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='IRECV_INDEX', message_size_bytes=index_recv_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Irecv([all_index_rbuffers[j], MPI.INT], source=src, tag=1))
-                            else:
-                                reqs.append(comm.Irecv([all_index_rbuffers[j], MPI.INT], source=src, tag=1))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ISEND_VALUE', message_size_bytes=value_send_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
-                            else:
-                                reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='IRECV_VALUE', message_size_bytes=value_recv_size, layer_name=new_name, phase='sparse', iteration=self._current_iteration, epoch=self._current_epoch):
-                                    reqs.append(comm.Irecv([all_value_rbuffers[j], MPI.FLOAT], source=src, tag=2))
-                            else:
-                                reqs.append(comm.Irecv([all_value_rbuffers[j], MPI.FLOAT], source=src, tag=2))
+                            #logging to analize size of messages (added to the original final logging file)
+                            index_send_size = all_index_sbuffers[dst].nbytes
+                            index_recv_size = all_index_rbuffers[j].nbytes
+                            value_send_size = all_value_sbuffers[dst].nbytes
+                            value_recv_size = all_value_rbuffers[j].nbytes
+                            logger.info(f"ISEND_INDEX|rank={rank}|dest={dst}|tag=1|size={index_send_size}|size_mb={index_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_INDEX|rank={rank}|src={src}|tag=1|size={index_recv_size}|size_mb={index_recv_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"ISEND_VALUE|rank={rank}|dest={dst}|tag=2|size={value_send_size}|size_mb={value_send_size/1e6:.2f}|layer={new_name}")
+                            logger.info(f"IRECV_VALUE|rank={rank}|src={src}|tag=2|size={value_recv_size}|size_mb={value_recv_size/1e6:.2f}|layer={new_name}")
+                            reqs.append(comm.Isend([all_index_sbuffers[dst], MPI.INT], dest=dst, tag=1))
+                            reqs.append(comm.Irecv([all_index_rbuffers[j], MPI.INT], source=src, tag=1))
+                            reqs.append(comm.Isend([all_value_sbuffers[dst], MPI.FLOAT], dest=dst, tag=2))
+                            reqs.append(comm.Irecv([all_value_rbuffers[j], MPI.FLOAT], source=src, tag=2))
 
                         chunk_offset = chunk_offsets[i-1]
                         chunk_size = chunk_offsets[i]-chunk_offsets[i-1]
@@ -892,17 +867,9 @@ class AllReducer():
                         #gindexes += region_offsets[rank]
                         send_size[0] = gvalues.size * 2
                         
-                        # profiling for time of communications
-                        if self._timing_logger is not None:
-                            with self._timing_logger.record_mpi_operation(operation='ALLGATHER_SENDSIZE_TOPK',
-                                                                          message_size_bytes=send_size.nbytes,
-                                                                          layer_name=new_name,
-                                                                          phase='sparse',
-                                                                          iteration=self._current_iteration,
-                                                                          epoch=self._current_epoch):
-                                comm.Allgather(send_size, recv_sizes)
-                        else:
-                            comm.Allgather(send_size, recv_sizes)
+                        #logging to analize size of messages (added to the original final logging file)
+                        
+                        comm.Allgather(send_size, recv_sizes)
 
                         offsets[1:] = recv_sizes[:-1]
                         offsets = np.cumsum(offsets)
@@ -914,18 +881,9 @@ class AllReducer():
                         send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                         send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
                         
-                        #profiling for the time of communications
+                        #logging to analize size of messages (added to the original final logging file)
                         
-                        if self._timing_logger is not None:
-                            with self._timing_logger.record_mpi_operation(operation='ALLGATHERV_TOPK',
-                                                                          message_size_bytes=send_buffer.nbytes,
-                                                                          layer_name=new_name,
-                                                                          phase='sparse',
-                                                                          iteration=self._current_iteration,
-                                                                          epoch=self._current_epoch):
-                                comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
-                        else:
-                            comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
+                        comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                         all_gindexes = np.zeros(total_size//2, dtype='int32')
                         all_gvalues = np.zeros(total_size//2, dtype='float32')
@@ -966,18 +924,9 @@ class AllReducer():
                             gvalues = reduced[gindexes]
                             send_size[0] = gvalues.size * 2
                             
-                            #profiling for time of communications
+                            #logging to analize size of messages (added to the original final logging file)
                             
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ALLGATHER_SENDSIZE_GRAD',
-                                                                              message_size_bytes=send_size.nbytes,
-                                                                              layer_name=new_name,
-                                                                              phase='sparse',
-                                                                              iteration=self._current_iteration,
-                                                                              epoch=self._current_epoch):
-                                    comm.Allgather(send_size, recv_sizes)
-                            else:
-                                comm.Allgather(send_size, recv_sizes)
+                            comm.Allgather(send_size, recv_sizes)
 
                             offsets[1:] = recv_sizes[:-1]
                             offsets = np.cumsum(offsets)
@@ -989,18 +938,9 @@ class AllReducer():
                             send_buffer[0 : send_size[0]//2] = gindexes.astype(np.int32)
                             send_buffer[send_size[0]//2 : send_size[0]] = gvalues.astype(np.float32)
 
-                            #profiling for time of communications
+                            #logging to analize size of messages (added to the original final logging file)
                             
-                            if self._timing_logger is not None:
-                                with self._timing_logger.record_mpi_operation(operation='ALLGATHERV_GRAD',
-                                                                              message_size_bytes=send_buffer.nbytes,
-                                                                              layer_name=new_name,
-                                                                              phase='sparse',
-                                                                              iteration=self._current_iteration,
-                                                                              epoch=self._current_epoch):
-                                    comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
-                            else:
-                                comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
+                            comm.Allgatherv(send_buffer, [recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                             all_gindexes = np.zeros(total_size//2, dtype='int32')
                             all_gvalues = np.zeros(total_size//2, dtype='float32')
@@ -1031,17 +971,10 @@ class AllReducer():
                         gvalues = gvalues.cpu().numpy()
                         send_size[0] = gvalues.size * 2
                         
-                        #profiling for time of communications
-                        if self._timing_logger is not None:
-                            with self._timing_logger.record_mpi_operation(operation='ALLGATHER_SENDSIZE_FINAL',
-                                                                          message_size_bytes=send_size.nbytes,
-                                                                          layer_name=new_name,
-                                                                          phase='sparse',
-                                                                          iteration=self._current_iteration,
-                                                                          epoch=self._current_epoch):
-                                comm.Allgather(send_size, recv_sizes)
-                        else:
-                            comm.Allgather(send_size, recv_sizes)
+                        #logging to analize size of messages (added to the original final logging file)
+                        
+                        
+                        comm.Allgather(send_size, recv_sizes)
 
                         offsets[1:] = recv_sizes[:-1]
                         offsets = np.cumsum(offsets)
@@ -1162,17 +1095,10 @@ class AllReducer():
 
                         allgather_recv_buffer = np.zeros(total_size, dtype='float32')
                         
-                        #profiling for time of communications
-                        if self._timing_logger is not None:
-                            with self._timing_logger.record_mpi_operation(operation='ALLGATHERV_SPARSE_REDUCTION',
-                                                                          message_size_bytes=send_buffer.nbytes,
-                                                                          layer_name=new_name,
-                                                                          phase='sparse',
-                                                                          iteration=self._current_iteration,
-                                                                          epoch=self._current_epoch):
-                                comm.Allgatherv(send_buffer, [allgather_recv_buffer, recv_sizes, offsets, MPI.FLOAT])
-                        else:
-                            comm.Allgatherv(send_buffer, [allgather_recv_buffer, recv_sizes, offsets, MPI.FLOAT])
+                        #logging to analize size of messages (added to the original final logging file)
+                        send_buffer_size_bytes = send_buffer.nbytes
+                        logger.info(f"ALLGATHERV_FINAL|rank={rank}|size={send_buffer_size_bytes}|size_mb={send_buffer_size_bytes/1e6:.2f}|layer={new_name}")
+                        comm.Allgatherv(send_buffer, [allgather_recv_buffer, recv_sizes, offsets, MPI.FLOAT])
 
                         all_gindexes = np.zeros(total_size//2, dtype='int32')
                         all_gvalues = np.zeros(total_size//2, dtype='float32')
